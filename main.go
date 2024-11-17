@@ -10,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/viper"
@@ -72,6 +74,20 @@ func GetSerializer[T any](format string) (Serializer[T], error) {
 	}
 } 
 
+type App struct {
+	DB *pgx.Conn
+	LogChan chan ExecutionLog
+	Wg *sync.WaitGroup
+}
+
+type ExecutionLog struct {
+	Id int
+	TaskName string 
+	StartTime time.Time 
+	EndTime time.Time
+	DurationSeconds float64
+}
+
 func main() {
 	envPath := flag.String("env", "", "Путь до файла .env")
 	flag.Parse()
@@ -89,14 +105,61 @@ func main() {
 
 	defer conn.Close(ctx)
 
-	http.HandleFunc("/all", GetAll)
+	logChan := make(chan ExecutionLog, 100)
+	wg := &sync.WaitGroup{}
+	
+	app := &App{
+		DB: conn,
+		LogChan: logChan,
+		Wg: wg,
+	}
+
+	http.HandleFunc("/all", app.GetAll)
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		fmt.Println("Ошибка запуска сервера:", err)
 	}
+
+	close(logChan)
+	wg.Wait()
+	fmt.Println("Сервер завершил работу")
 }
 
-func GetAll(w http.ResponseWriter, r *http.Request) {
+func (app *App) storeExecutionLog(el ExecutionLog) error {
+	_, err := app.DB.Exec(
+		context.Background(),
+		"INSERT INTO execution_logs (task_name, start_time, end_time, duration_seconds) VALUES ($1, $2, $3, $4)",
+		el.TaskName,
+		el.StartTime,
+		el.EndTime,
+		el.DurationSeconds,
+	)
+
+	return err
+}
+
+func (app *App) LogExecutionTime(taskName string, action func()) {
+	startTime := time.Now()
+
+	action()
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime).Seconds()
+
+	logEntry := ExecutionLog{
+		TaskName: taskName,
+		StartTime: startTime,
+		EndTime: endTime,
+		DurationSeconds: duration,
+	}
+
+	app.Wg.Add(1)
+	app.LogChan <- logEntry
+}
+
+func (app *App) GetAll(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+
 	allPlaces, err := fetchAllPlaces()
 	if err != nil {
 		fmt.Printf("Ошибка: %s", err)
@@ -118,7 +181,27 @@ func GetAll(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Ошибка: %s", err)
 	}
 
+	endTime := time.Now()
+	duration := endTime.Sub(startTime).Seconds()
+
+	app.storeExecutionLog(ExecutionLog{
+		TaskName: "GetAll",
+		StartTime: startTime,
+		EndTime: endTime,
+		DurationSeconds: duration,
+	})
 	w.Write(deserializedData)
+}
+
+func (app *App) proccesLog() {
+	for logEntry := range app.LogChan {
+		err := app.storeExecutionLog(logEntry)
+		if err != nil {
+			fmt.Printf("Ощибка записи лога: %s\n", err)
+		}
+
+		app.Wg.Done()
+	}
 }
 
 func fetchAllPlaces() ([]Place, error) {
